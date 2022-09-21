@@ -1,0 +1,385 @@
+---
+title: "hmo_proteomics"
+author: "Renee Oles"
+date: "5/18/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(mzR)
+library(limma)
+library("knitr")
+library("wrMisc")
+library("wrProteo")
+library("wrGraph")
+library(ggfortify)
+library(ggpubr)
+library(DEqMS)
+library(fgsea)
+library(RColorBrewer)
+library(viridis)
+require(limma)
+require(qvalue)
+require(effsize)
+library(car)
+library(openxlsx)
+maxAdjP <- 0.05
+minLog2FC <- 2
+hmo <- read.delim("bt.txt")
+name <- "BT/bt_"
+hmo_matrix<-as.matrix(hmo[,c(4:ncol(hmo))], dimnames=list(hmo$ProteinID,colnames(hmo)[4:ncol(hmo)]))
+rownames(hmo_matrix) <- hmo$ProteinID
+hmo_matrix1 <- t(hmo_matrix)
+ref <- hmo[,c(1:3)]
+hmo <- melt(setDT(hmo), id.vars = c("ProteinID","Name","Description"), variable.name = "HMO")
+wb <- createWorkbook(paste(name,"proteomics.xlsx",sep=""))
+protein_id <- hmo[,c(1:3)]
+protein_id <- unique(protein_id)
+```
+# Summary Statistics
+
+### Data Distribution
+```{r}
+# Boxplot
+ggplot(hmo, aes(x=HMO,y=value))+
+  geom_violin()+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 90))+
+  ylab(label="log2 Intensity")
+ggsave(paste(name,"hmo_violin.png",sep=""),height=8, width=12)
+```
+
+```{r, include=FALSE}
+hmo_matrix_meta <- as.data.frame(hmo_matrix1)
+hmo_matrix_meta$HMO <- rownames(hmo_matrix1)
+hmo_matrix_meta <- hmo_matrix_meta %>% separate(HMO, into = c('HMO', 'Rep'), sep = -1, convert = TRUE)
+n <- ncol(hmo_matrix_meta)-2
+pca_res <- prcomp(hmo_matrix_meta[,c(1:n)], center=TRUE, scale. = TRUE)
+```
+
+### PCA Plot
+```{r}
+# The proportion of variance means this is the amount of variance that is explained by this model 
+summary(pca_res)
+
+autoplot(pca_res,data=hmo_matrix_meta,colour="HMO", size=4, frame=TRUE)+
+  theme_classic()+
+  scale_color_manual(values=c("#3ead65","#4287f5","#b058a3","#c47e45"))
+ggsave(paste(name,"hmo_pca.png",sep=""))
+```
+
+### ANOVA test between each groups
+This test makes a linear model to see if the groups contribute to changing the protein concentrations 
+```{r}
+hmo <- hmo %>% separate(HMO, into = c('HMO', 'Rep'), sep = -1, convert = TRUE)
+model <- lm(value ~ HMO,data=hmo)
+summary(model)
+Anova(model)
+```
+
+### Pairwise t-test
+```{r}
+pairwise.t.test(hmo$value,hmo$HMO,p.adj="BH")
+```
+
+
+### Which proteins are the most differentially expressed between the groups
+Using the ANOVA model to test significance of each of the proteins individually
+```{r, include=FALSE}
+dfANOVA <- t(hmo_matrix)
+df <- as.data.frame(dfANOVA)
+df$Group <- as.vector(sapply(rownames(df),function(x) { substr(x,1,nchar(x)-1)}))
+anovaResults <- aov(dfANOVA ~ Group, data = df)
+sum_test <- as.data.frame(unlist(summary(anovaResults)))
+sum_test$name <- row.names(sum_test)
+sum_test <- separate(sum_test, name,into=c("blank","Response","ID"),sep=" ")
+sum_test <- separate(sum_test, ID,into=c("ID","type"),sep="\\.")
+sum_test <- sum_test[sum_test$type=="Pr(>F)1",c(-2,-3)]
+sum_test <- sum_test[,c(-3)]
+colnames(sum_test)[1] <- "pval"
+dfANOVA <- as.data.frame(t(dfANOVA))
+dfANOVA$pval <- sum_test$pval
+
+#Average groups
+library(dplyr)
+TP1 <- (dfANOVA[,1] + dfANOVA[,2] + dfANOVA[,3])/3
+TP2 <- (dfANOVA[,4] + dfANOVA[,5] + dfANOVA[,6])/3
+TP3 <- (dfANOVA[,7] + dfANOVA[,8] + dfANOVA[,9])/3
+Glc <- (dfANOVA[,10] + dfANOVA[,11] + dfANOVA[,12])/3
+dfANOVA_edit <- data.frame(TP1,TP2,TP3,Glc)
+dfANOVA_edit$MaxLog2FC <- apply(dfANOVA_edit, 1, function(x){max(x)-min(x)})
+dfANOVA_edit$pval <- dfANOVA$pval
+dfANOVA_edit$pval_BH_adj <- p.adjust(dfANOVA$pval, method="BH")
+```
+
+
+
+```{r, include=FALSE}
+hmo <- separate(hmo, HMO, into = c("group","rep"), remove=FALSE, sep=-1)
+hmo <- separate(hmo, group, into = c("pref","group","post"), remove=FALSE, sep="_")
+
+calc_ttest <- function(df, gr1, gr2, maxAdjP, minFC, colg1, colg2) {
+#  df <- df[df$group == gr1 | df$group == gr2,]
+  df_ttest <- dfANOVA_edit[,c(gr1,gr2)]
+  rownames(df_ttest) <- rownames(df)
+  #Log2 fold change group2 - group1
+  df_ttest$Log2FC <- df_ttest[,1] - df_ttest[,2]
+  df_ttest$pval <- apply(df, 1, function(x) t.test(x[colg1], x[colg2])$p.value)
+  #Benjamini-Hochberg correction for multiple testing
+  df_ttest$adjPval <- p.adjust(df_ttest$pval, method = "BH")
+  df_ttest$Log10adjPval <- -1*log10(df_ttest$adjPval)
+  #Add the categorical column for easier visualization
+  df_ttest$Diff_Abund <- apply(
+    df_ttest, 1, function(x) {
+      if (x[["adjPval"]] <= maxAdjP & x[["Log2FC"]] >= minLog2FC) {
+        return( paste("Up", gr2) )
+      } else if (x[["adjPval"]] <= maxAdjP & x[["Log2FC"]] <= -1*minLog2FC) {
+        return( paste("Down", gr1) )
+      } else {
+        return('Non-significant')
+      }
+    }
+  )
+  df_ttest
+}
+```
+
+
+# Calculate significant proteins between each group
+### TP1 vs Glc
+```{r}
+gr1 <- "TP1"
+gr2 <- "Glc"
+colg1 <- seq(1,3)
+colg2 <- seq(10,12)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+df_ttest <- left_join(df_ttest,protein_id)
+#write.table(df_ttest,paste(name,"tp1_vs_glc.txt",sep=""),quote=FALSE,sep="\t")
+addWorksheet(wb,"tp1_vs_glc")
+writeDataTable(wb,1,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >=minLog2FC | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+```{r}
+volc
+#ggsave(paste(name,"tp1_vs_glc.png",sep=""),height=12,width=12)
+```
+
+
+### TP2 vs Glc
+```{r}
+gr1 <- "TP2"
+gr2 <- "Glc"
+colg1 <- seq(4,6)
+colg2 <- seq(10,12)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+df_ttest <- left_join(df_ttest,protein_id)
+#write.table(df_ttest,paste(name,"tp2_vs_glc.txt",sep=""),quote=FALSE,sep="\t")
+addWorksheet(wb,"tp2_vs_glc")
+writeDataTable(wb,2,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >=minLog2FC | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+
+```{r}
+volc
+#ggsave(paste(name,"tp2_vs_glc.png",sep=""),height=12,width=12)
+```
+
+
+### TP3 vs Glc
+```{r}
+gr1 <- "TP3"
+gr2 <- "Glc"
+colg1 <- seq(7,9)
+colg2 <- seq(10,12)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+#write.table(df_ttest,paste(name,"tp3_vs_glc.txt",sep=""),quote=FALSE,sep="\t")
+df_ttest <- left_join(df_ttest,protein_id)
+addWorksheet(wb,"tp3_vs_glc")
+writeDataTable(wb,3,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >= minLog2FC  | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+```{r}
+volc
+#ggsave(paste(name,"tp3_vs_glc.png",sep=""),height=12,width=12)
+```
+
+
+### TP1 vs TP2
+```{r}
+gr1 <- "TP1"
+gr2 <- "TP2"
+colg1 <- seq(1,3)
+colg2 <- seq(4,6)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+#write.table(df_ttest,paste(name,"tp1_vs_tp2.txt",sep=""),quote=FALSE,sep="\t")
+df_ttest <- left_join(df_ttest,protein_id)
+addWorksheet(wb,"tp1_vs_tp2")
+writeDataTable(wb,4,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >=minLog2FC | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+```{r}
+volc
+#ggsave(paste(name,"tp1_vs_tp2.png",sep=""),height=12,width=12)
+```
+
+### TP1 vs TP3
+```{r}
+gr1 <- "TP1"
+gr2 <- "TP3"
+colg1 <- seq(1,3)
+colg2 <- seq(7,9)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+#write.table(df_ttest,paste(name,"tp1_vs_tp3.txt",sep=""),quote=FALSE,sep="\t")
+df_ttest <- left_join(df_ttest,protein_id)
+addWorksheet(wb,"tp1_vs_tp3")
+writeDataTable(wb,5,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >=minLog2FC | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+```{r}
+volc
+#ggsave(paste(name,"tp1_vs_tp3.png",sep=""),height=12,width=12)
+```
+
+### TP2 vs TP3
+```{r}
+gr1 <- "TP2"
+gr2 <- "TP3"
+colg1 <- seq(4,6)
+colg2 <- seq(7,9)
+df_ttest <- calc_ttest(dfANOVA, gr1, gr2, maxAdjP, minLog2FC, colg1, colg2)
+df_ttest$ProteinID <- rownames(df_ttest)
+#write.table(df_ttest,paste(name,"tp2_vs_tp3.txt",sep=""),quote=FALSE,sep="\t")
+df_ttest <- left_join(df_ttest,protein_id)
+addWorksheet(wb,"tp2_vs_tp3")
+writeDataTable(wb,6,df_ttest)
+```
+
+```{r, include=FALSE}
+volc <- ggplot(df_ttest,aes(x = Log2FC, y = Log10adjPval, colour = Diff_Abund )) +
+  geom_point(shape=19, size=1, alpha = 0.6)+
+  geom_hline(yintercept = -1*log10(maxAdjP), colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = -1*minLog2FC, colour = "gray65") +
+  geom_vline(xintercept = minLog2FC, colour = "gray65") +
+  ggtitle(paste("T-test ", gr1, " vs ", gr2," Adjusted P-value<=", maxAdjP, " Log2 FC>=", minLog2FC,
+      sep="")) +
+  theme_classic() +
+  theme(legend.title = element_blank(), legend.text = element_text(size=12),
+    plot.title = element_text(size=16)) +
+  scale_color_manual(values=c("red","black","red"))+
+  labs(x = paste("Log2 FC", gr2, "-", gr1), y = "-Log10 Adj. P-value" ) +
+  geom_text(data = subset(df_ttest, (Log2FC >=minLog2FC | Log2FC <= -minLog2FC) & adjPval < 0.05),
+    aes( Log2FC, Log10adjPval, label = ProteinID),
+    alpha = 0.6, hjust = 0.5, vjust = -0.6, size=2)
+```
+
+```{r}
+volc
+#ggsave(paste(name,"tp2_vs_tp3.png",sep=""),height=12,width=12)
+saveWorkbook(wb, file = paste(name,"proteomics.xlsx",sep=""), overwrite = TRUE)
+```
